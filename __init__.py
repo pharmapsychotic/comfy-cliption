@@ -174,6 +174,7 @@ class CLIPtionModel(nn.Module):
         self.tokenizer = clip.tokenizer.clip_l.tokenizer
         self.text_model = clip.cond_stage_model.clip_l.transformer.text_model
         self.vision_model = clip_vision.model.vision_model
+        self.clip_vision = clip_vision
 
         # create caption decoder
         self.captioner = Captioner(config, 1024, self.tokenizer.vocab_size)
@@ -204,16 +205,18 @@ class CLIPtionModel(nn.Module):
         return self.tokenizer
 
     def generate(self, images, temperature=0.7):
-        vision_outputs = self.vision_model(images)
-        image_features = vision_outputs.last_hidden_state
-        return self.captioner.generate(
-            image_features,
-            temperature,
-            self.tokenizer,
-            self.output_projection,
-            self.text_model.embeddings.token_embedding,
-            self.text_model.embeddings.position_embedding,
-        )
+        device = comfy.model_management.get_torch_device()
+        image_features = self.clip_vision.encode_image(images).last_hidden_state
+        image_features = image_features.to(device, dtype=torch.float16)
+        with torch.amp.autocast("cuda"):
+            return self.captioner.generate(
+                image_features,
+                temperature,
+                self.tokenizer,
+                self.output_projection,
+                self.text_model.embeddings.token_embedding,
+                self.text_model.embeddings.position_embedding,
+            )
 
 
 class CLIPtionLoader:
@@ -255,6 +258,7 @@ class CLIPtionLoader:
 class CLIPtion:
     CATEGORY = "pharmapsychotic"
     FUNCTION = "caption"
+    OUTPUT_IS_LIST = (True,)
     RETURN_TYPES = ("STRING",)
 
     @classmethod
@@ -267,7 +271,15 @@ class CLIPtion:
         }
 
     def caption(self, model, image):
-        return ("this is the caption",)
+        tokens = model.generate(image)
+        tokenizer = model.get_tokenizer()
+        captions = []
+        for idx in range(tokens.size(0)):
+            tokens = tokens[idx]#.tolist
+            caption = tokenizer.decode(tokens, skip_special_tokens=True, clean_up_tokenization_spaces=True)
+            captions.append(caption)
+
+        return (captions,)
 
 
 NODE_CLASS_MAPPINGS = {
