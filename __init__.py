@@ -4,7 +4,6 @@ from types import SimpleNamespace
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torchvision.transforms as transforms
 from safetensors import safe_open
 from transformers import CLIPTokenizer
 
@@ -35,12 +34,9 @@ class DecoderBlock(nn.Module):
         self.mlp = nn.Sequential(
             nn.Linear(embed_dim, embed_dim * 4),
             nn.GELU(),
+            nn.Dropout(0.1),
             nn.Linear(embed_dim * 4, embed_dim),
         )
-
-        self.gamma1 = nn.Parameter(torch.ones(embed_dim))
-        self.gamma2 = nn.Parameter(torch.ones(embed_dim))
-        self.gamma3 = nn.Parameter(torch.ones(embed_dim))
 
     def forward(self, x, memory, self_attn_mask=None):
         # self attention with mask
@@ -52,7 +48,7 @@ class DecoderBlock(nn.Module):
             need_weights=False,
             is_causal=True,
         )
-        x = residual + self.gamma1 * attn_output
+        x = residual + attn_output
 
         # cross attention
         residual = x
@@ -60,12 +56,12 @@ class DecoderBlock(nn.Module):
         attn_output, _ = self.cross_attn(
             query=x, key=memory, value=memory, need_weights=False
         )
-        x = residual + self.gamma2 * attn_output
+        x = residual + attn_output
 
         # FFN
         residual = x
         x = self.norm3(x)
-        x = residual + self.gamma3 * self.mlp(x)
+        x = residual + self.mlp(x)
 
         return x
 
@@ -236,7 +232,7 @@ class CLIPtionLoader:
     def load(self, clip, clip_vision):
         state_dict = {}
         base_path = os.path.dirname(os.path.abspath(__file__))
-        model_path = os.path.join(base_path, "CLIPtion_ViTL_20241129_fp16.safetensors")
+        model_path = os.path.join(base_path, "CLIPtion_20241214_fp16.safetensors")
         with safe_open(model_path, framework="pt", device="cpu") as f:
             for key in f.keys():
                 state_dict[key] = f.get_tensor(key)
@@ -275,7 +271,7 @@ class CLIPtion:
         tokenizer = model.get_tokenizer()
         captions = []
         for idx in range(tokens.size(0)):
-            tokens = tokens[idx]#.tolist
+            tokens = tokens[idx]
             caption = tokenizer.decode(tokens, skip_special_tokens=True, clean_up_tokenization_spaces=True)
             captions.append(caption)
 
