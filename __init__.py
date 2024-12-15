@@ -1,5 +1,6 @@
 import os
 from types import SimpleNamespace
+from typing import List
 
 import torch
 import torch.nn as nn
@@ -43,7 +44,9 @@ class DecoderBlock(nn.Module):
         residual = x
         x = self.norm1(x)
         attn_output, _ = self.self_attn(
-            query=x, key=x, value=x,
+            query=x,
+            key=x,
+            value=x,
             attn_mask=self_attn_mask,
             need_weights=False,
             is_causal=True,
@@ -80,10 +83,12 @@ class Captioner(nn.Module):
         self.memory_pos_embedding = nn.Parameter(torch.zeros(1, 257, self.hidden_dim))
 
         # decoder layers
-        self.layers = nn.ModuleList([
-            DecoderBlock(config.hidden_dim, config.num_heads)
-            for i in range(config.num_blocks)
-        ])
+        self.layers = nn.ModuleList(
+            [
+                DecoderBlock(config.hidden_dim, config.num_heads)
+                for i in range(config.num_blocks)
+            ]
+        )
 
         causal_mask = nn.Transformer.generate_square_subsequent_mask(self.max_length)
         self.register_buffer("causal_mask", causal_mask, persistent=False)
@@ -170,7 +175,12 @@ class CLIPtionModel(nn.Module):
         self.tokenizer = clip.tokenizer.clip_l.tokenizer
         self.text_model = clip.cond_stage_model.clip_l.transformer.text_model
         self.vision_model = clip_vision.model.vision_model
+        self.clip_text_projection = (
+            clip.cond_stage_model.clip_l.transformer.text_projection
+        )
+        self.clip_visual_projection = clip_vision.model.visual_projection
         self.clip_vision = clip_vision
+        self.clip_text = clip
 
         # create caption decoder
         self.captioner = Captioner(config, 1024, self.tokenizer.vocab_size)
@@ -200,19 +210,64 @@ class CLIPtionModel(nn.Module):
     def get_tokenizer(self) -> CLIPTokenizer:
         return self.tokenizer
 
-    def generate(self, images, temperature=0.7):
+    def generate(self, images, temperature=0.7, best_of=1) -> List[str]:
         device = comfy.model_management.get_torch_device()
-        image_features = self.clip_vision.encode_image(images).last_hidden_state
-        image_features = image_features.to(device, dtype=torch.float16)
-        with torch.amp.autocast("cuda"):
-            return self.captioner.generate(
-                image_features,
-                temperature,
-                self.tokenizer,
-                self.output_projection,
-                self.text_model.embeddings.token_embedding,
-                self.text_model.embeddings.position_embedding,
+
+        image_outputs = self.clip_vision.encode_image(images)
+        image_embeds = image_outputs.image_embeds
+        image_features = image_outputs.last_hidden_state
+
+        captions = []
+        for image_idx in range(image_features.size(0)):
+            candidates = []
+            for _ in range(best_of):
+                with torch.amp.autocast("cuda"):
+                    features = (
+                        image_features[image_idx]
+                        .unsqueeze(0)
+                        .to(device, dtype=torch.float16)
+                    )
+                    tokens = self.captioner.generate(
+                        features,
+                        temperature,
+                        self.tokenizer,
+                        self.output_projection,
+                        self.text_model.embeddings.token_embedding,
+                        self.text_model.embeddings.position_embedding,
+                    )
+                text = self.tokenizer.decode(
+                    tokens.squeeze(),
+                    skip_special_tokens=True,
+                    clean_up_tokenization_spaces=True,
+                )
+                candidates.append(text)
+
+            if best_of == 1:
+                captions.append(candidates[0])
+                continue
+
+            # calculate CLIP similarity for each candidate
+            scored = []
+            embeds = (
+                image_embeds[image_idx].unsqueeze(0).to(device, dtype=torch.float16)
             )
+            embeds = embeds / embeds.norm(dim=-1, keepdim=True)
+            for text in candidates:
+                comfy_tokens = self.clip_text.tokenize(text)
+                _, text_embeds = self.clip_text.encode_from_tokens(
+                    comfy_tokens, return_pooled=True, return_dict=False
+                )
+                text_embeds = text_embeds.to(device, dtype=torch.float16)
+                text_embeds = text_embeds / text_embeds.norm(dim=-1, keepdim=True)
+                clip_sim = torch.sum(embeds * text_embeds, dim=-1)[0]
+                print(f"({clip_sim.item()}) {text}")
+                scored.append((clip_sim, text))
+
+            # return the candidate with the highest similarity
+            scored.sort(key=lambda x: x[0], reverse=True)
+            captions.append(scored[0][1])
+
+        return captions
 
 
 class CLIPtionLoader:
@@ -224,11 +279,14 @@ class CLIPtionLoader:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "clip": ("CLIP", {"tooltip": "The CLIP model used for encoding the text."}),
+                "clip": (
+                    "CLIP",
+                    {"tooltip": "The CLIP model used for encoding the text."},
+                ),
                 "clip_vision": ("CLIP_VISION",),
             }
         }
-    
+
     def load(self, clip, clip_vision):
         state_dict = {}
         base_path = os.path.dirname(os.path.abspath(__file__))
@@ -237,17 +295,13 @@ class CLIPtionLoader:
             for key in f.keys():
                 state_dict[key] = f.get_tensor(key)
 
-        config = SimpleNamespace(**{
-            'hidden_dim': 768,
-            'num_heads': 8,
-            'num_blocks': 6,
-            'max_length': 77
-        })
+        config = SimpleNamespace(
+            **{"hidden_dim": 768, "num_heads": 8, "num_blocks": 6, "max_length": 77}
+        )
         model = CLIPtionModel(config, clip, clip_vision)
         model.captioner.load_state_dict(state_dict)
         model.eval()
         model.to(comfy.model_management.get_torch_device())
-
         return (model,)
 
 
@@ -262,23 +316,48 @@ class CLIPtion:
         return {
             "required": {
                 "model": ("CLIPTION_MODEL", {"tooltip": "The CLIPtion model."}),
-                "image": ("IMAGE", ),
+                "image": ("IMAGE",),
             }
         }
 
     def caption(self, model, image):
-        tokens = model.generate(image)
-        tokenizer = model.get_tokenizer()
-        captions = []
-        for idx in range(tokens.size(0)):
-            tokens = tokens[idx]
-            caption = tokenizer.decode(tokens, skip_special_tokens=True, clean_up_tokenization_spaces=True)
-            captions.append(caption)
-
+        captions = model.generate(image)
         return (captions,)
+
+
+class CLIPtionGenerate:
+    CATEGORY = "pharmapsychotic"
+    FUNCTION = "caption"
+    OUTPUT_IS_LIST = (True,)
+    RETURN_TYPES = ("STRING",)
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "model": ("CLIPTION_MODEL", {"tooltip": "The CLIPtion model."}),
+                "image": ("IMAGE",),
+            },
+            "optional": {
+                "temperature": (
+                    "FLOAT",
+                    {"default": 0.7, "tooltip": "Temperature for sampling."},
+                ),
+                "best_of": (
+                    "INT",
+                    {"default": 1, "tooltip": "Number of options to evaluate."},
+                ),
+            },
+        }
+
+    def caption(self, model, image, temperature=0.7, best_of=1):
+        with torch.inference_mode():
+            captions = model.generate(image, temperature, best_of)
+        return ([captions],)
 
 
 NODE_CLASS_MAPPINGS = {
     "CLIPtionLoader": CLIPtionLoader,
+    "CLIPtionGenerate": CLIPtionGenerate,
     "CLIPtion": CLIPtion,
 }
