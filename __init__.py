@@ -1,3 +1,4 @@
+import logging
 import os
 from types import SimpleNamespace
 from typing import List
@@ -186,6 +187,7 @@ class CLIPtionModel(nn.Module):
         self.clip_visual_projection = clip_vision.model.visual_projection
         self.clip_vision = clip_vision
         self.clip_text = clip
+        self.text_projection = nn.Linear(768, 768, bias=False)
 
         # create caption decoder
         self.captioner = Captioner(config, 1024, self.tokenizer.vocab_size)
@@ -219,8 +221,11 @@ class CLIPtionModel(nn.Module):
         device = comfy.model_management.get_torch_device()
 
         image_outputs = self.clip_vision.encode_image(images)
-        image_embeds = image_outputs.image_embeds
         image_features = image_outputs.last_hidden_state
+
+        image_embeds = image_outputs.image_embeds
+        image_embeds = image_embeds.to(device, dtype=torch.float16)
+        image_embeds /= image_embeds.norm(dim=-1, keepdim=True)
 
         captions = []
         for image_idx in range(image_features.size(0)):
@@ -255,26 +260,28 @@ class CLIPtionModel(nn.Module):
 
             # calculate CLIP similarity for each candidate
             scored = []
-            embeds = (
-                image_embeds[image_idx].unsqueeze(0).to(device, dtype=torch.float16)
-            )
-            embeds = embeds / embeds.norm(dim=-1, keepdim=True)
+            image_embed = image_embeds[image_idx:image_idx+1]
             for text in candidates:
-                comfy_tokens = self.clip_text.tokenize(text)
-                _, text_embeds = self.clip_text.encode_from_tokens(
-                    comfy_tokens, return_pooled=True, return_dict=False
-                )
-                text_embeds = text_embeds.to(device, dtype=torch.float16)
-                text_embeds = text_embeds / text_embeds.norm(dim=-1, keepdim=True)
-                clip_sim = torch.sum(embeds * text_embeds, dim=-1)[0]
-                print(f"({clip_sim.item()}) {text}")
+                text_embeds = self._text_to_embed(text, device)
+                clip_sim = torch.sum(image_embed * text_embeds, dim=-1)[0]
                 scored.append((clip_sim, text))
 
             # return the candidate with the highest similarity
             scored.sort(key=lambda x: x[0], reverse=True)
+            for score, text in scored:
+                logging.debug(f"({score.item()}) {text}")
             captions.append(scored[0][1])
 
         return captions
+
+    def _text_to_embed(self, text: str, device: torch.device) -> torch.Tensor:
+        tokens = self.clip_text.tokenize(text)
+        _, pooled = self.clip_text.encode_from_tokens(
+            tokens, return_pooled="unprojected"
+        )
+        text_embeds = self.text_projection(pooled.to(device, dtype=torch.float16))
+        text_embeds = text_embeds / text_embeds.norm(dim=-1, keepdim=True)
+        return text_embeds
 
 
 class CLIPtionLoader:
@@ -301,14 +308,16 @@ class CLIPtionLoader:
         with safe_open(model_path, framework="pt", device="cpu") as f:
             for key in f.keys():
                 state_dict[key] = f.get_tensor(key)
+        tp_dict = {"weight": state_dict.pop("text_projection.weight")}
 
         config = SimpleNamespace(
             **{"hidden_dim": 768, "num_heads": 8, "num_blocks": 6, "max_length": 77}
         )
         model = CLIPtionModel(config, clip, clip_vision)
         model.captioner.load_state_dict(state_dict)
+        model.text_projection.load_state_dict(tp_dict)
         model.eval()
-        model.to(comfy.model_management.get_torch_device())
+        model.to(comfy.model_management.get_torch_device(), dtype=torch.float16)
         return (model,)
 
 
@@ -344,7 +353,15 @@ class CLIPtionGenerate:
             "required": {
                 "model": ("CLIPTION_MODEL", {"tooltip": "The CLIPtion model."}),
                 "image": ("IMAGE",),
-                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "tooltip": "The random seed used for creating the caption."}),
+                "seed": (
+                    "INT",
+                    {
+                        "default": 0,
+                        "min": 0,
+                        "max": 0xFFFFFFFFFFFFFFFF,
+                        "tooltip": "The random seed used for creating the caption.",
+                    },
+                ),
             },
             "optional": {
                 "temperature": (
