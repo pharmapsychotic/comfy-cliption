@@ -35,7 +35,7 @@ class DecoderBlock(nn.Module):
         self.mlp = nn.Sequential(
             nn.Linear(embed_dim, embed_dim * 4),
             nn.GELU(),
-            nn.Dropout(0.1),
+            nn.Identity(),
             nn.Linear(embed_dim * 4, embed_dim),
         )
 
@@ -86,7 +86,7 @@ class Captioner(nn.Module):
         self.layers = nn.ModuleList(
             [
                 DecoderBlock(config.hidden_dim, config.num_heads)
-                for i in range(config.num_blocks)
+                for _ in range(config.num_blocks)
             ]
         )
 
@@ -119,6 +119,7 @@ class Captioner(nn.Module):
         output_projection,
         token_embedding_,
         pos_embedding_,
+        seed=None,
     ):
         # project and add positional embeddings to image features
         memory = self.projection(image_features)
@@ -133,6 +134,10 @@ class Captioner(nn.Module):
             device=image_features.device,
         )
         generated_tokens = [current_tokens]
+
+        generator = torch.Generator(device=image_features.device)
+        if seed is not None:
+            generator.manual_seed(seed)
 
         for _ in range(self.max_length - 2):
             # embed current tokens
@@ -155,7 +160,7 @@ class Captioner(nn.Module):
             logits = output_projection(x[:, -1:])
             logits = logits / temperature  # temperature
             probs = F.softmax(logits, dim=-1)
-            next_token = torch.multinomial(probs.squeeze(1), 1)
+            next_token = torch.multinomial(probs.squeeze(1), 1, generator=generator)
 
             generated_tokens.append(next_token)
             current_tokens = torch.cat([current_tokens, next_token], dim=1)
@@ -210,7 +215,7 @@ class CLIPtionModel(nn.Module):
     def get_tokenizer(self) -> CLIPTokenizer:
         return self.tokenizer
 
-    def generate(self, images, temperature=0.7, best_of=1) -> List[str]:
+    def generate(self, images, seed=42, temperature=0.7, best_of=1) -> List[str]:
         device = comfy.model_management.get_torch_device()
 
         image_outputs = self.clip_vision.encode_image(images)
@@ -234,7 +239,9 @@ class CLIPtionModel(nn.Module):
                         self.output_projection,
                         self.text_model.embeddings.token_embedding,
                         self.text_model.embeddings.position_embedding,
+                        seed=seed,
                     )
+                    seed += 1
                 text = self.tokenizer.decode(
                     tokens.squeeze(),
                     skip_special_tokens=True,
@@ -290,7 +297,7 @@ class CLIPtionLoader:
     def load(self, clip, clip_vision):
         state_dict = {}
         base_path = os.path.dirname(os.path.abspath(__file__))
-        model_path = os.path.join(base_path, "CLIPtion_20241214_fp16.safetensors")
+        model_path = os.path.join(base_path, "CLIPtion_20241219_fp16.safetensors")
         with safe_open(model_path, framework="pt", device="cpu") as f:
             for key in f.keys():
                 state_dict[key] = f.get_tensor(key)
@@ -337,6 +344,7 @@ class CLIPtionGenerate:
             "required": {
                 "model": ("CLIPTION_MODEL", {"tooltip": "The CLIPtion model."}),
                 "image": ("IMAGE",),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "tooltip": "The random seed used for creating the caption."}),
             },
             "optional": {
                 "temperature": (
@@ -350,9 +358,9 @@ class CLIPtionGenerate:
             },
         }
 
-    def caption(self, model, image, temperature=0.7, best_of=1):
+    def caption(self, model, image, seed, temperature=0.7, best_of=1):
         with torch.inference_mode():
-            captions = model.generate(image, temperature, best_of)
+            captions = model.generate(image, seed, temperature, best_of)
         return ([captions],)
 
 
