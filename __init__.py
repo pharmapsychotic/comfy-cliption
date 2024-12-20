@@ -214,10 +214,13 @@ class CLIPtionModel(nn.Module):
 
         return self.captioner(image_features, token_embeddings, self.output_projection)
 
-    def get_tokenizer(self) -> CLIPTokenizer:
-        return self.tokenizer
-
-    def generate(self, images, seed=42, temperature=0.7, best_of=1) -> List[str]:
+    def generate(
+        self,
+        images: torch.Tensor,
+        seed: int = 42,
+        temperature: float = 0.7,
+        best_of: int = 1,
+    ) -> List[str]:
         device = comfy.model_management.get_torch_device()
 
         image_outputs = self.clip_vision.encode_image(images)
@@ -231,22 +234,21 @@ class CLIPtionModel(nn.Module):
         for image_idx in range(image_features.size(0)):
             candidates = []
             for _ in range(best_of):
-                with torch.amp.autocast("cuda"):
-                    features = (
-                        image_features[image_idx]
-                        .unsqueeze(0)
-                        .to(device, dtype=torch.float16)
-                    )
-                    tokens = self.captioner.generate(
-                        features,
-                        temperature,
-                        self.tokenizer,
-                        self.output_projection,
-                        self.text_model.embeddings.token_embedding,
-                        self.text_model.embeddings.position_embedding,
-                        seed=seed,
-                    )
-                    seed += 1
+                features = (
+                    image_features[image_idx]
+                    .unsqueeze(0)
+                    .to(device, dtype=torch.float16)
+                )
+                tokens = self.captioner.generate(
+                    features,
+                    temperature,
+                    self.tokenizer,
+                    self.output_projection,
+                    self.text_model.embeddings.token_embedding,
+                    self.text_model.embeddings.position_embedding,
+                    seed=seed,
+                )
+                seed += 1
                 text = self.tokenizer.decode(
                     tokens.squeeze(),
                     skip_special_tokens=True,
@@ -260,7 +262,7 @@ class CLIPtionModel(nn.Module):
 
             # calculate CLIP similarity for each candidate
             scored = []
-            image_embed = image_embeds[image_idx:image_idx+1]
+            image_embed = image_embeds[image_idx : image_idx + 1]
             for text in candidates:
                 text_embeds = self._text_to_embed(text, device)
                 clip_sim = torch.sum(image_embed * text_embeds, dim=-1)[0]
@@ -273,6 +275,141 @@ class CLIPtionModel(nn.Module):
             captions.append(scored[0][1])
 
         return captions
+
+    def generate_beam(
+        self,
+        images: torch.Tensor,
+        temperature: float = 0.7,
+        beam_width: int = 4,
+    ) -> List[str]:
+        device = comfy.model_management.get_torch_device()
+
+        # get image features and embeddings
+        image_outputs = self.clip_vision.encode_image(images)
+        image_features = image_outputs.last_hidden_state.to(device, dtype=torch.float16)
+        image_embeds = image_outputs.image_embeds.to(device, dtype=torch.float16)
+        image_embeds /= image_embeds.norm(dim=-1, keepdim=True)
+
+        captions = []
+        for image_idx in range(image_features.size(0)):
+            features = image_features[image_idx].unsqueeze(0)
+            candidates = self._beam_search(
+                features,
+                image_embeds[image_idx : image_idx + 1],
+                device,
+                beam_width=beam_width,
+                temperature=temperature,
+            )
+            # pick highest scoring candidate
+            candidates.sort(key=lambda x: x[0], reverse=True)
+            for score, text in candidates:
+                logging.debug(f"({score:.3f}) {text}")
+            captions.append(candidates[0][1])
+        return captions
+
+    def get_tokenizer(self) -> CLIPTokenizer:
+        return self.tokenizer
+
+    def _beam_search(
+        self,
+        image_features: torch.Tensor,
+        image_embed: torch.Tensor,
+        device: torch.device,
+        beam_width: int = 5,
+        temperature: float = 0.7,
+    ):
+        tokenizer = self.tokenizer
+        captioner = self.captioner
+        token_embedding = self.text_model.embeddings.token_embedding
+        pos_embedding = self.text_model.embeddings.position_embedding
+        vocab_size = tokenizer.vocab_size
+
+        # project image features
+        memory = captioner.projection(image_features)
+        memory = memory + captioner.memory_pos_embedding
+
+        # start with beam_width copies of BOS token
+        current_tokens = torch.full(
+            (beam_width, 1), tokenizer.bos_token_id, dtype=torch.long, device=device
+        )
+
+        # track sequence scores
+        scores = torch.zeros(beam_width, device=device)
+
+        for step in range(captioner.max_length - 2):
+            # embed current tokens
+            token_embeddings = token_embedding(current_tokens)
+            positions = torch.arange(current_tokens.size(1), device=device)
+            pos_embeddings = pos_embedding(positions)
+            x = token_embeddings + pos_embeddings
+
+            # run decoder layers
+            seq_len = x.size(1)
+            mask = captioner.causal_mask[:seq_len, :seq_len]
+            for layer in captioner.layers:
+                x = layer(x, memory.repeat(beam_width, 1, 1), self_attn_mask=mask)
+
+            # get next token logits and log probabilities
+            logits = self.output_projection(x[:, -1:])
+            logits = logits / temperature
+            log_probs = F.log_softmax(logits, dim=-1)
+
+            if step == 0:
+                # pick top-k tokens for first step
+                scores = log_probs.squeeze(1)[0]
+                scores, indices = scores.topk(beam_width)
+                current_tokens = torch.cat(
+                    [current_tokens[0:1].repeat(beam_width, 1), indices.unsqueeze(1)],
+                    dim=1,
+                )
+            else:
+                # find sequences that have already ended
+                finished_seqs = (current_tokens == tokenizer.eos_token_id).any(dim=1)
+
+                # calculate scores for next tokens
+                next_scores = scores.unsqueeze(1) + log_probs.squeeze(
+                    1
+                )  # [8 sequences x vocab_size options]
+                next_scores = next_scores.view(-1)  # flatten to [8*vocab_size]
+
+                # mask out all continuations of finished sequences except first EOS token
+                if finished_seqs.any():
+                    # for each finished sequence, only allow one EOS continuation
+                    for seq_idx in finished_seqs.nonzero().squeeze(1):
+                        vocab_start = seq_idx * vocab_size
+                        # set all continuations to -inf except the EOS token
+                        next_scores[vocab_start : vocab_start + vocab_size] = float(
+                            "-inf"
+                        )
+                        next_scores[vocab_start + tokenizer.eos_token_id] = scores[
+                            seq_idx
+                        ]
+
+                # pick top beam_width sequences
+                scores, indices = next_scores.topk(beam_width)
+                beam_indices = indices // vocab_size  # which sequence each came from
+                token_indices = indices % vocab_size  # which token to append
+
+                current_tokens = torch.cat(
+                    [current_tokens[beam_indices], token_indices.unsqueeze(1)], dim=1
+                )
+
+            # check if all beams ended with EOS
+            if (current_tokens[:, -1] == tokenizer.eos_token_id).all():
+                break
+
+        # rank final candidates by CLIP similarity
+        candidates = []
+        for idx in range(beam_width):
+            text = tokenizer.decode(
+                current_tokens[idx],
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=True,
+            )
+            text_embeds = self._text_to_embed(text, device)
+            clip_sim = torch.sum(image_embed * text_embeds, dim=-1)[0]
+            candidates.append((clip_sim.item(), text))
+        return candidates
 
     def _text_to_embed(self, text: str, device: torch.device) -> torch.Tensor:
         tokens = self.clip_text.tokenize(text)
@@ -321,26 +458,6 @@ class CLIPtionLoader:
         return (model,)
 
 
-class CLIPtion:
-    CATEGORY = "pharmapsychotic"
-    FUNCTION = "caption"
-    OUTPUT_IS_LIST = (True,)
-    RETURN_TYPES = ("STRING",)
-
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "model": ("CLIPTION_MODEL", {"tooltip": "The CLIPtion model."}),
-                "image": ("IMAGE",),
-            }
-        }
-
-    def caption(self, model, image):
-        captions = model.generate(image)
-        return (captions,)
-
-
 class CLIPtionGenerate:
     CATEGORY = "pharmapsychotic"
     FUNCTION = "caption"
@@ -370,19 +487,66 @@ class CLIPtionGenerate:
                 ),
                 "best_of": (
                     "INT",
-                    {"default": 1, "tooltip": "Number of options to evaluate."},
+                    {
+                        "default": 1,
+                        "min": 1,
+                        "max": 64,
+                        "tooltip": "Number of options to evaluate.",
+                    },
                 ),
             },
         }
 
-    def caption(self, model, image, seed, temperature=0.7, best_of=1):
+    def caption(self, model: CLIPtionModel, image, seed, temperature=0.7, best_of=1):
         with torch.inference_mode():
             captions = model.generate(image, seed, temperature, best_of)
-        return ([captions],)
+        return (captions,)
+
+
+class CLIPtionBeamSearch:
+    CATEGORY = "pharmapsychotic"
+    FUNCTION = "caption"
+    OUTPUT_IS_LIST = (True,)
+    RETURN_TYPES = ("STRING",)
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "model": ("CLIPTION_MODEL", {"tooltip": "The CLIPtion model."}),
+                "image": ("IMAGE",),
+                "beam_width": (
+                    "INT",
+                    {
+                        "default": 4,
+                        "min": 1,
+                        "max": 64,
+                        "tooltip": "Number of beams to maintain during search.",
+                    },
+                ),
+            },
+            "optional": {
+                "temperature": (
+                    "FLOAT",
+                    {"default": 0.7, "tooltip": "Temperature for token sampling."},
+                ),
+            },
+        }
+
+    def caption(
+        self,
+        model: CLIPtionModel,
+        image: torch.Tensor,
+        beam_width: int = 4,
+        temperature: float = 0.7,
+    ):
+        with torch.inference_mode():
+            captions = model.generate_beam(image, temperature, beam_width)
+        return (captions,)
 
 
 NODE_CLASS_MAPPINGS = {
-    "CLIPtionLoader": CLIPtionLoader,
+    "CLIPtionBeamSearch": CLIPtionBeamSearch,
     "CLIPtionGenerate": CLIPtionGenerate,
-    "CLIPtion": CLIPtion,
+    "CLIPtionLoader": CLIPtionLoader,
 }
