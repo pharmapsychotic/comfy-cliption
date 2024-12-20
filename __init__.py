@@ -177,6 +177,11 @@ class CLIPtionModel(nn.Module):
     def __init__(self, config, clip, clip_vision):
         super().__init__()
 
+        if not hasattr(clip, "cond_stage_model"):
+            raise ValueError("CLIP is missing from model checkpoint")
+        if not hasattr(clip.cond_stage_model, "clip_l"):
+            raise ValueError("Must use model which includes CLIP-L")
+
         # store CLIP models
         self.tokenizer = clip.tokenizer.clip_l.tokenizer
         self.text_model = clip.cond_stage_model.clip_l.transformer.text_model
@@ -413,9 +418,11 @@ class CLIPtionModel(nn.Module):
 
     def _text_to_embed(self, text: str, device: torch.device) -> torch.Tensor:
         tokens = self.clip_text.tokenize(text)
-        _, pooled = self.clip_text.encode_from_tokens(
-            tokens, return_pooled="unprojected"
-        )
+        self.clip_text.load_model()
+        self.clip_text.cond_stage_model.reset_clip_options()
+        self.clip_text.cond_stage_model.set_clip_options({"projected_pooled": False})
+        clip_l = self.clip_text.cond_stage_model.clip_l
+        _, pooled = clip_l.encode_token_weights(tokens["l"])
         text_embeds = self.text_projection(pooled.to(device, dtype=torch.float16))
         text_embeds = text_embeds / text_embeds.norm(dim=-1, keepdim=True)
         return text_embeds
