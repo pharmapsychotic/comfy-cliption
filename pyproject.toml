@@ -1,0 +1,15 @@
+[project]
+name = "comfyui-cliption"
+description = "Generate image captions/prompts using the CLIP-L model you already have loaded"
+version = "1.0.0"
+license = { file = "LICENCE.txt" }
+dependencies = ["huggingface-hub", "safetensors", "transformers"]
+
+[project.urls]
+Repository = "https://github.com/pharmapsychotic/comfy-cliption"
+
+# Used by Comfy Registry https://comfyregistry.org
+[tool.comfy]
+PublisherId = "pharmapsychotic"
+DisplayName = "ComfyUI-CLIPtion"
+Icon = ""
