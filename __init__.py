@@ -99,69 +99,6 @@ class Captioner(nn.Module):
         causal_mask = nn.Transformer.generate_square_subsequent_mask(self.max_length)
         self.register_buffer("causal_mask", causal_mask, persistent=False)
 
-    def generate(
-        self,
-        image_features: torch.Tensor,
-        temperature: float,
-        tokenizer: CLIPTokenizer,
-        output_projection: nn.Module,
-        token_embedding_: nn.Module,
-        pos_embedding_: nn.Module,
-        seed: Optional[int] = None,
-        ramble: bool = False,
-    ):
-        # project and add positional embeddings to image features
-        memory = self.projection(image_features)
-        memory = memory + self.memory_pos_embedding
-
-        # start with BOS token
-        batch_size = image_features.size(0)
-        current_tokens = torch.full(
-            (batch_size, 1),
-            tokenizer.bos_token_id,
-            dtype=torch.long,
-            device=image_features.device,
-        )
-        generated_tokens = [current_tokens]
-
-        generator = torch.Generator(device=image_features.device)
-        if seed is not None:
-            generator.manual_seed(seed)
-
-        for _ in range(self.max_length - 2):
-            # embed current tokens
-            token_embeddings = token_embedding_(current_tokens)
-            positions = torch.arange(
-                current_tokens.size(1), device=current_tokens.device
-            )
-            pos_embeddings = pos_embedding_(positions)
-            x = token_embeddings + pos_embeddings
-
-            # get causal mask for self-attention
-            seq_len = x.size(1)
-            mask = self.causal_mask[:seq_len, :seq_len]
-
-            # pass through decoder layers
-            for layer in self.layers:
-                x = layer(x, memory, self_attn_mask=mask)
-
-            # get next token
-            logits = output_projection(x[:, -1:])
-            logits = logits / temperature
-            if ramble:
-                logits[:, :, tokenizer.eos_token_id] = -float("inf")
-            probs = F.softmax(logits, dim=-1)
-            next_token = torch.multinomial(probs.squeeze(1), 1, generator=generator)
-
-            generated_tokens.append(next_token)
-            current_tokens = torch.cat([current_tokens, next_token], dim=1)
-
-            # stop if all sequences have EOS token
-            if (next_token == tokenizer.eos_token_id).all():
-                break
-
-        return torch.cat(generated_tokens, dim=1)
-
 
 class CLIPtionModel(nn.Module):
     def __init__(self, config, clip, clip_vision):
@@ -205,57 +142,52 @@ class CLIPtionModel(nn.Module):
     ) -> List[str]:
         device = comfy.model_management.get_torch_device()
 
+        # encode images
         image_outputs = self.clip_vision.encode_image(images)
-        image_features = image_outputs.last_hidden_state
-
-        image_embeds = image_outputs.image_embeds
-        image_embeds = image_embeds.to(device, dtype=torch.float16)
+        image_features = image_outputs.last_hidden_state.to(device, dtype=torch.float16)
+        image_embeds = image_outputs.image_embeds.to(device, dtype=torch.float16)
         image_embeds /= image_embeds.norm(dim=-1, keepdim=True)
 
         captions = []
         for image_idx in range(image_features.size(0)):
-            candidates = []
-            for _ in range(best_of):
-                features = (
-                    image_features[image_idx]
-                    .unsqueeze(0)
-                    .to(device, dtype=torch.float16)
-                )
-                tokens = self.captioner.generate(
-                    features,
-                    temperature,
-                    self.tokenizer,
-                    self.output_projection,
-                    self.text_model.embeddings.token_embedding,
-                    self.text_model.embeddings.position_embedding,
-                    seed=seed,
-                    ramble=ramble,
-                )
-                seed += 1
+            features = image_features[image_idx : image_idx + 1]
+            image_embed = image_embeds[image_idx : image_idx + 1]
+
+            # generate candidates in parallel using single copy of features
+            tokens = self._batch_generate(
+                features,
+                temperature,
+                best_of,
+                seed + image_idx,
+                ramble=ramble,
+            )
+
+            if best_of == 1:
                 text = self.tokenizer.decode(
-                    tokens.squeeze(),
+                    tokens[0],
                     skip_special_tokens=True,
                     clean_up_tokenization_spaces=True,
                 )
-                candidates.append(text)
-
-            if best_of == 1:
-                captions.append(candidates[0])
+                captions.append(text)
                 continue
 
             # calculate CLIP similarity for each candidate
-            scored = []
-            image_embed = image_embeds[image_idx : image_idx + 1]
-            for text in candidates:
+            candidates = []
+            for token_seq in tokens:
+                text = self.tokenizer.decode(
+                    token_seq,
+                    skip_special_tokens=True,
+                    clean_up_tokenization_spaces=True,
+                )
                 text_embeds = self._text_to_embed(text, device)
                 clip_sim = torch.sum(image_embed * text_embeds, dim=-1)[0]
-                scored.append((clip_sim, text))
+                candidates.append((clip_sim.item(), text))
 
-            # return the candidate with the highest similarity
-            scored.sort(key=lambda x: x[0], reverse=True)
-            for score, text in scored:
-                logging.debug(f"({score.item()}) {text}")
-            captions.append(scored[0][1])
+            # pick highest scoring candidate
+            candidates.sort(key=lambda x: x[0], reverse=False)
+            for score, text in candidates:
+                logging.debug(f"({score:.3f}) {text}")
+            captions.append(candidates[-1][1])
 
         return captions
 
@@ -286,14 +218,85 @@ class CLIPtionModel(nn.Module):
                 ramble=ramble,
             )
             # pick highest scoring candidate
-            candidates.sort(key=lambda x: x[0], reverse=True)
+            candidates.sort(key=lambda x: x[0], reverse=False)
             for score, text in candidates:
                 logging.debug(f"({score:.3f}) {text}")
-            captions.append(candidates[0][1])
+            captions.append(candidates[-1][1])
         return captions
 
     def get_tokenizer(self) -> CLIPTokenizer:
         return self.tokenizer
+
+    def _batch_generate(
+        self,
+        image_features: torch.Tensor,
+        temperature: float,
+        batch_size: int,
+        seed: Optional[int] = None,
+        ramble: bool = False,
+    ) -> torch.Tensor:
+        tokenizer = self.tokenizer
+        output_projection = self.output_projection
+        token_embedding_ = self.text_model.embeddings.token_embedding
+        pos_embedding_ = self.text_model.embeddings.position_embedding
+
+        # project and add positional embeddings to image features
+        memory = self.captioner.projection(image_features)
+        memory = memory + self.captioner.memory_pos_embedding
+        memory = memory.repeat(batch_size, 1, 1)
+
+        # initialize sequences with EOS tokens and BOS at start
+        sequences = torch.full(
+            (batch_size, self.captioner.max_length),
+            tokenizer.eos_token_id,
+            dtype=torch.long,
+            device=image_features.device,
+        )
+        sequences[:, 0] = tokenizer.bos_token_id
+        current_length = 1
+
+        # set up random generator
+        generator = torch.Generator(device=image_features.device)
+        if seed is not None:
+            generator.manual_seed(seed)
+
+        # generate tokens until hitting max length or all sequences have EOS
+        for current_length in range(1, self.captioner.max_length - 1):
+            # embed current sequences
+            token_embeddings = token_embedding_(sequences[:, :current_length])
+            positions = torch.arange(current_length, device=sequences.device)
+            pos_embeddings = pos_embedding_(positions)
+            x = token_embeddings + pos_embeddings
+
+            # pass through decoder layers
+            mask = self.captioner.causal_mask[:current_length, :current_length]
+            for layer in self.captioner.layers:
+                x = layer(x, memory, self_attn_mask=mask)
+
+            # get next token probabilities
+            logits = output_projection(x[:, -1:])
+            logits = logits / temperature
+
+            # force EOS for sequences that hit EOS, prevent EOS for rambling sequences
+            prev_is_eos = sequences[:, current_length - 1] == tokenizer.eos_token_id
+            vocab_mask = torch.zeros_like(logits)
+            vocab_mask[prev_is_eos, :, :] = float("-inf")
+            vocab_mask[prev_is_eos, :, tokenizer.eos_token_id] = 0
+            if ramble:
+                vocab_mask[~prev_is_eos, :, tokenizer.eos_token_id] = float("-inf")
+            logits = logits + vocab_mask
+
+            probs = F.softmax(logits, dim=-1)
+            next_tokens = torch.multinomial(probs.squeeze(1), 1, generator=generator)
+
+            # add tokens to sequences
+            sequences[:, current_length] = next_tokens.squeeze(-1)
+
+            # stop if all sequences generated an EOS token
+            if not ramble and (next_tokens == tokenizer.eos_token_id).all():
+                break
+
+        return sequences
 
     def _beam_search(
         self,
@@ -351,29 +354,18 @@ class CLIPtionModel(nn.Module):
                     dim=1,
                 )
             else:
-                # find sequences that have already ended
-                finished_seqs = (current_tokens == tokenizer.eos_token_id).any(dim=1)
+                # calculate scores for next tokens [beam_width x vocab_size]
+                next_scores = scores.unsqueeze(1) + log_probs.squeeze(1)
 
-                # calculate scores for next tokens
-                next_scores = scores.unsqueeze(1) + log_probs.squeeze(
-                    1
-                )  # [8 sequences x vocab_size options]
-                next_scores = next_scores.view(-1)  # flatten to [8*vocab_size]
-
-                # mask out all continuations of finished sequences except first EOS token
-                if finished_seqs.any():
-                    # for each finished sequence, only allow one EOS continuation
-                    for seq_idx in finished_seqs.nonzero().squeeze(1):
-                        vocab_start = seq_idx * vocab_size
-                        # set all continuations to -inf except the EOS token
-                        next_scores[vocab_start : vocab_start + vocab_size] = float(
-                            "-inf"
-                        )
-                        next_scores[vocab_start + tokenizer.eos_token_id] = scores[
-                            seq_idx
-                        ]
+                # force sequences to continue EOS after first one
+                prev_is_eos = current_tokens[:, -1] == tokenizer.eos_token_id
+                vocab_mask = torch.zeros_like(next_scores)
+                vocab_mask[prev_is_eos] = float("-inf")
+                vocab_mask[prev_is_eos, tokenizer.eos_token_id] = 0
+                next_scores = next_scores + vocab_mask
 
                 # pick top beam_width sequences
+                next_scores = next_scores.view(-1)
                 scores, indices = next_scores.topk(beam_width)
                 beam_indices = indices // vocab_size  # which sequence each came from
                 token_indices = indices % vocab_size  # which token to append
