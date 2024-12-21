@@ -6,13 +6,13 @@ from typing import List
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from huggingface_hub import hf_hub_download
 from safetensors import safe_open
 from transformers import CLIPTokenizer
 
 import comfy.model_management
 import comfy.sample
 import comfy.utils
-import folder_paths
 
 
 class DecoderBlock(nn.Module):
@@ -447,8 +447,16 @@ class CLIPtionLoader:
 
     def load(self, clip, clip_vision):
         state_dict = {}
+        file = "CLIPtion_20241219_fp16.safetensors"
         base_path = os.path.dirname(os.path.abspath(__file__))
-        model_path = os.path.join(base_path, "CLIPtion_20241219_fp16.safetensors")
+        if os.path.exists(os.path.join(base_path, file)):
+            model_path = os.path.join(base_path, file)
+        else:
+            repo_id = "pharmapsychotic/CLIPtion"
+            revision = "15ee8cb77a902616478a033332011ff640e72277"
+            model_path = hf_hub_download(
+                repo_id=repo_id, filename=file, revision=revision
+            )
         with safe_open(model_path, framework="pt", device="cpu") as f:
             for key in f.keys():
                 state_dict[key] = f.get_tensor(key)
