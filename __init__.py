@@ -1,7 +1,7 @@
 import logging
 import os
 from types import SimpleNamespace
-from typing import List
+from typing import List, Optional
 
 import torch
 import torch.nn as nn
@@ -16,7 +16,7 @@ import comfy.utils
 
 
 class DecoderBlock(nn.Module):
-    def __init__(self, embed_dim, num_heads):
+    def __init__(self, embed_dim: int, num_heads: int):
         super().__init__()
         self.norm1 = nn.LayerNorm(embed_dim)
         self.self_attn = nn.MultiheadAttention(
@@ -40,7 +40,12 @@ class DecoderBlock(nn.Module):
             nn.Linear(embed_dim * 4, embed_dim),
         )
 
-    def forward(self, x, memory, self_attn_mask=None):
+    def forward(
+        self,
+        x: torch.Tensor,
+        memory: torch.Tensor,
+        self_attn_mask: Optional[torch.Tensor] = None,
+    ):
         # self attention with mask
         residual = x
         x = self.norm1(x)
@@ -94,33 +99,16 @@ class Captioner(nn.Module):
         causal_mask = nn.Transformer.generate_square_subsequent_mask(self.max_length)
         self.register_buffer("causal_mask", causal_mask, persistent=False)
 
-    def forward(self, image_features, token_embeddings, output_projection):
-        # project and add positional embeddings to image features
-        memory = self.projection(image_features)
-        memory = memory + self.memory_pos_embedding
-
-        # get causal mask for self-attention
-        seq_len = token_embeddings.size(1)
-        mask = self.causal_mask[:seq_len, :seq_len]
-
-        # pass through decoder layers
-        x = token_embeddings
-        for layer in self.layers:
-            x = layer(x, memory, self_attn_mask=mask)
-
-        # project to vocabulary
-        logits = output_projection(x)
-        return logits
-
     def generate(
         self,
-        image_features,
-        temperature,
-        tokenizer,
-        output_projection,
-        token_embedding_,
-        pos_embedding_,
-        seed=None,
+        image_features: torch.Tensor,
+        temperature: float,
+        tokenizer: CLIPTokenizer,
+        output_projection: nn.Module,
+        token_embedding_: nn.Module,
+        pos_embedding_: nn.Module,
+        seed: Optional[int] = None,
+        ramble: bool = False,
     ):
         # project and add positional embeddings to image features
         memory = self.projection(image_features)
@@ -159,7 +147,9 @@ class Captioner(nn.Module):
 
             # get next token
             logits = output_projection(x[:, -1:])
-            logits = logits / temperature  # temperature
+            logits = logits / temperature
+            if ramble:
+                logits[:, :, tokenizer.eos_token_id] = -float("inf")
             probs = F.softmax(logits, dim=-1)
             next_token = torch.multinomial(probs.squeeze(1), 1, generator=generator)
 
@@ -182,16 +172,15 @@ class CLIPtionModel(nn.Module):
         if not hasattr(clip.cond_stage_model, "clip_l"):
             raise ValueError("Must use model which includes CLIP-L")
 
-        # store CLIP models
+        # store CLIP model references
+        self.clip_text = clip
+        self.clip_vision = clip_vision
         self.tokenizer = clip.tokenizer.clip_l.tokenizer
         self.text_model = clip.cond_stage_model.clip_l.transformer.text_model
         self.vision_model = clip_vision.model.vision_model
-        self.clip_text_projection = (
-            clip.cond_stage_model.clip_l.transformer.text_projection
-        )
-        self.clip_visual_projection = clip_vision.model.visual_projection
-        self.clip_vision = clip_vision
-        self.clip_text = clip
+
+        # clip.cond_stage_model.clip_l.transformer.text_projection is empty
+        # so load a copy from the CLIPtion safetensors file instead
         self.text_projection = nn.Linear(768, 768, bias=False)
 
         # create caption decoder
@@ -206,25 +195,13 @@ class CLIPtionModel(nn.Module):
             clip_embed_weight.clone(), requires_grad=False
         )
 
-    def forward(self, images, captions=None):
-        vision_outputs = self.vision_model(images)
-        image_features = vision_outputs.last_hidden_state
-
-        token_embeddings = None
-        if captions is not None:
-            token_embeddings = self.text_model.embeddings.token_embedding(captions)
-            positions = torch.arange(captions.size(1), device=captions.device)
-            pos_embeddings = self.text_model.embeddings.position_embedding(positions)
-            token_embeddings = token_embeddings + pos_embeddings
-
-        return self.captioner(image_features, token_embeddings, self.output_projection)
-
     def generate(
         self,
         images: torch.Tensor,
         seed: int = 42,
         temperature: float = 0.7,
         best_of: int = 1,
+        ramble: bool = False,
     ) -> List[str]:
         device = comfy.model_management.get_torch_device()
 
@@ -252,6 +229,7 @@ class CLIPtionModel(nn.Module):
                     self.text_model.embeddings.token_embedding,
                     self.text_model.embeddings.position_embedding,
                     seed=seed,
+                    ramble=ramble,
                 )
                 seed += 1
                 text = self.tokenizer.decode(
@@ -286,6 +264,7 @@ class CLIPtionModel(nn.Module):
         images: torch.Tensor,
         temperature: float = 0.7,
         beam_width: int = 4,
+        ramble: bool = False,
     ) -> List[str]:
         device = comfy.model_management.get_torch_device()
 
@@ -304,6 +283,7 @@ class CLIPtionModel(nn.Module):
                 device,
                 beam_width=beam_width,
                 temperature=temperature,
+                ramble=ramble,
             )
             # pick highest scoring candidate
             candidates.sort(key=lambda x: x[0], reverse=True)
@@ -322,6 +302,7 @@ class CLIPtionModel(nn.Module):
         device: torch.device,
         beam_width: int = 5,
         temperature: float = 0.7,
+        ramble: bool = False,
     ):
         tokenizer = self.tokenizer
         captioner = self.captioner
@@ -357,6 +338,8 @@ class CLIPtionModel(nn.Module):
             # get next token logits and log probabilities
             logits = self.output_projection(x[:, -1:])
             logits = logits / temperature
+            if ramble:
+                logits[:, :, tokenizer.eos_token_id] = -float("inf")
             log_probs = F.log_softmax(logits, dim=-1)
 
             if step == 0:
@@ -509,12 +492,21 @@ class CLIPtionGenerate:
                         "tooltip": "Number of options to evaluate.",
                     },
                 ),
+                "ramble": ("BOOLEAN", {"default": False}),
             },
         }
 
-    def caption(self, model: CLIPtionModel, image, seed, temperature=0.7, best_of=1):
+    def caption(
+        self,
+        model: CLIPtionModel,
+        image: torch.Tensor,
+        seed: int,
+        temperature: float = 0.7,
+        best_of: int = 1,
+        ramble: bool = False,
+    ):
         with torch.inference_mode():
-            captions = model.generate(image, seed, temperature, best_of)
+            captions = model.generate(image, seed, temperature, best_of, ramble)
         return (captions,)
 
 
@@ -545,6 +537,7 @@ class CLIPtionBeamSearch:
                     "FLOAT",
                     {"default": 0.7, "tooltip": "Temperature for token sampling."},
                 ),
+                "ramble": ("BOOLEAN", {"default": False}),
             },
         }
 
@@ -554,9 +547,10 @@ class CLIPtionBeamSearch:
         image: torch.Tensor,
         beam_width: int = 4,
         temperature: float = 0.7,
+        ramble: bool = False,
     ):
         with torch.inference_mode():
-            captions = model.generate_beam(image, temperature, beam_width)
+            captions = model.generate_beam(image, temperature, beam_width, ramble)
         return (captions,)
 
 
