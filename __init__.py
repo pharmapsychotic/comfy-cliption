@@ -194,7 +194,6 @@ class CLIPtionModel(nn.Module):
     def generate_beam(
         self,
         images: torch.Tensor,
-        temperature: float = 0.7,
         beam_width: int = 4,
         ramble: bool = False,
     ) -> List[str]:
@@ -214,7 +213,6 @@ class CLIPtionModel(nn.Module):
                 image_embeds[image_idx : image_idx + 1],
                 device,
                 beam_width=beam_width,
-                temperature=temperature,
                 ramble=ramble,
             )
             # pick highest scoring candidate
@@ -304,7 +302,6 @@ class CLIPtionModel(nn.Module):
         image_embed: torch.Tensor,
         device: torch.device,
         beam_width: int = 5,
-        temperature: float = 0.7,
         ramble: bool = False,
     ):
         tokenizer = self.tokenizer
@@ -340,7 +337,6 @@ class CLIPtionModel(nn.Module):
 
             # get next token logits and log probabilities
             logits = self.output_projection(x[:, -1:])
-            logits = logits / temperature
             if ramble:
                 logits[:, :, tokenizer.eos_token_id] = -float("inf")
             log_probs = F.log_softmax(logits, dim=-1)
@@ -525,10 +521,6 @@ class CLIPtionBeamSearch:
                 ),
             },
             "optional": {
-                "temperature": (
-                    "FLOAT",
-                    {"default": 0.7, "tooltip": "Temperature for token sampling."},
-                ),
                 "ramble": ("BOOLEAN", {"default": False}),
             },
         }
@@ -538,11 +530,10 @@ class CLIPtionBeamSearch:
         model: CLIPtionModel,
         image: torch.Tensor,
         beam_width: int = 4,
-        temperature: float = 0.7,
         ramble: bool = False,
     ):
         with torch.inference_mode():
-            captions = model.generate_beam(image, temperature, beam_width, ramble)
+            captions = model.generate_beam(image, beam_width, ramble)
         return (captions,)
 
 
@@ -550,4 +541,10 @@ NODE_CLASS_MAPPINGS = {
     "CLIPtionBeamSearch": CLIPtionBeamSearch,
     "CLIPtionGenerate": CLIPtionGenerate,
     "CLIPtionLoader": CLIPtionLoader,
+}
+
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "CLIPtionBeamSearch": "CLIPtion Beam Search",
+    "CLIPtionGenerate": "CLIPtion Generate",
+    "CLIPtionLoader": "CLIPtion Loader",
 }
