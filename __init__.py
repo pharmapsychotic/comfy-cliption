@@ -148,6 +148,11 @@ class CLIPtionModel(nn.Module):
         image_embeds = image_outputs.image_embeds.to(device, dtype=torch.float16)
         image_embeds /= image_embeds.norm(dim=-1, keepdim=True)
 
+        if image_features.size(2) != 1024:
+            raise ValueError(
+                f"Expected image features to have 1024 dimensions but got {image_features.size(2)}. Please ensure you are using CLIP L."
+            )
+
         captions = []
         for image_idx in range(image_features.size(0)):
             features = image_features[image_idx : image_idx + 1]
@@ -204,6 +209,11 @@ class CLIPtionModel(nn.Module):
         image_features = image_outputs.last_hidden_state.to(device, dtype=torch.float16)
         image_embeds = image_outputs.image_embeds.to(device, dtype=torch.float16)
         image_embeds /= image_embeds.norm(dim=-1, keepdim=True)
+
+        if image_features.size(2) != 1024:
+            raise ValueError(
+                f"Expected image features to have 1024 dimensions but got {image_features.size(2)}. Please ensure you are using CLIP L."
+            )
 
         captions = []
         for image_idx in range(image_features.size(0)):
@@ -374,6 +384,12 @@ class CLIPtionModel(nn.Module):
             if (current_tokens[:, -1] == tokenizer.eos_token_id).all():
                 break
 
+        # add final EOS token
+        current_tokens = torch.cat(
+            [current_tokens, torch.full((beam_width, 1), tokenizer.eos_token_id, device=device)],
+            dim=1,
+        )
+
         # rank final candidates by CLIP similarity
         candidates = []
         for idx in range(beam_width):
@@ -402,7 +418,7 @@ class CLIPtionModel(nn.Module):
 class CLIPtionLoader:
     CATEGORY = "pharmapsychotic"
     FUNCTION = "load"
-    RETURN_TYPES = ("CLIPTION_MODEL",)
+    RETURN_TYPES = ("CLIPTION",)
 
     @classmethod
     def INPUT_TYPES(s):
@@ -454,7 +470,7 @@ class CLIPtionGenerate:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "model": ("CLIPTION_MODEL", {"tooltip": "The CLIPtion model."}),
+                "model": ("CLIPTION", {"tooltip": "The CLIPtion model."}),
                 "image": ("IMAGE",),
                 "seed": (
                     "INT",
@@ -508,7 +524,7 @@ class CLIPtionBeamSearch:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "model": ("CLIPTION_MODEL", {"tooltip": "The CLIPtion model."}),
+                "model": ("CLIPTION", {"tooltip": "The CLIPtion model."}),
                 "image": ("IMAGE",),
                 "beam_width": (
                     "INT",
