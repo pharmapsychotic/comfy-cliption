@@ -16,6 +16,8 @@ Big thanks to [Ben Egan](https://github.com/ProGamerGov), [SilentAntagonist](htt
 ![CLIPtion to FLUX Schnell](media/CIPtion-flux-schnell.jpg)
 [CIPtion-flux-schnell.json](media/CIPtion-flux-schnell.json)
 
+![CLIPtion to SD3.5 Large](media/CLIPtion-SD3.5L.jpg)
+[CLIPtion-SD3.5L.json](media/CLIPtion-SD3.5L.json)
 
 # Installation
 
