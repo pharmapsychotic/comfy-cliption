@@ -7,10 +7,14 @@ I made this for fun and am sure bigger dedicated caption models and VLM's will g
 Big thanks to [Ben Egan](https://github.com/ProGamerGov), [SilentAntagonist](https://huggingface.co/SilentAntagonist), [Alex Redden](https://github.com/aredden), [XWAVE](https://twitter.com/XWAVEart), and [Jacky-hate](https://github.com/Jacky-hate) whose synthetic caption datasets I included in the training.
 
 
-# Example workflow
+# Example workflows
+
 
 ![example workflow](media/CLIPtion-example.png)
 [CLIPtion-example.json](media/CLIPtion-example.json)
+
+![CLIPtion to FLUX Schnell](media/CIPtion-flux-schnell.jpg)
+[CIPtion-flux-schnell.json](media/CIPtion-flux-schnell.json)
 
 
 # Installation
