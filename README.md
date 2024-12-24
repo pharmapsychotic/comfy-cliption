@@ -1,6 +1,6 @@
 ![CLIPtion diagram](media/CLIPtion-diagram.png)
 
-**CLIPtion** is a fast and small captioning extension to [OpenAI CLIP](https://github.com/openai/CLIP/) ViT-L/14. You already have ViT-L loaded when using using Stable Diffusion, SDXL, SD3, FLUX, etc and with just an extra *100MB memory* you can include caption/prompt generation in your workflows!
+**CLIPtion** is a fast and small captioning extension to the [OpenAI CLIP](https://github.com/openai/CLIP/) ViT-L/14 used in Stable Diffusion, SDXL, SD3, FLUX, etc. Feed the CLIP and CLIP_VISION models in and CLIPtion powers them up giving you caption/prompt generation in your workflows!
 
 I made this for fun and am sure bigger dedicated caption models and VLM's will give you more accurate captioning, but this guy is tiny, fast, reuses what you already have loaded, and has options to give better CLIP alignment so give it a try if you like!
 
@@ -8,7 +8,6 @@ Big thanks to [Ben Egan](https://github.com/ProGamerGov), [SilentAntagonist](htt
 
 
 # Example workflows
-
 
 ![example workflow](media/CLIPtion-example.png)
 [CLIPtion-example.json](media/CLIPtion-example.json)
@@ -27,8 +26,12 @@ cd custom_nodes
 git clone https://github.com/pharmapsychotic/comfy-cliption.git
 pip install -r comfy-cliption/requirements.txt
 ```
-2. Download [CLIPtion_20241219_fp16.safetensors](https://huggingface.co/pharmapsychotic/CLIPtion/blob/main/CLIPtion_20241219_fp16.safetensors) and put in your `ComfyUI/custom_nodes/comfy-cliption` directory. You can skip this step to let it auto-download on first use to your `HF_HOME` cache.
-3. Restart ComfyUI
+2. Optionally download [CLIPtion_20241219_fp16.safetensors](https://huggingface.co/pharmapsychotic/CLIPtion/blob/main/CLIPtion_20241219_fp16.safetensors) and put in your `ComfyUI/custom_nodes/comfy-cliption` directory. You can skip this step to let it auto-download on first use to your `HF_HOME` cache.
+4. Restart ComfyUI
+
+You should have the CLIP L text encoder already from SD, SDXL, SD3, FLUX. You also need the CLIP L vision encoder for the Load CLIP Vision node. You can download this through the ComfyUI Manager > Model Manager > search "clip vision large" > click Install for openai/clip-vit-large.
+
+The example workflows use the [ComfyUI-Custom-Scripts](https://github.com/pythongosssss/ComfyUI-Custom-Scripts.git) node for previewing the caption strings. So you'll probably want to install that as well if you don't have it already. 
 
 # Nodes
 
@@ -45,6 +48,7 @@ Create caption from an image or batch of images.
 
 ## CLIPtion Beam Search
 
+Deterministic search for caption from an image or batch of images. Less "creative" than Generate node.
 * `beam_width` - how many alternative captions are considered in parallel - higher values explore more possibilities but take longer
 * `ramble` - forces generation of full 77 tokens
 

@@ -81,8 +81,8 @@ class Captioner(nn.Module):
 
         self.embed_dim = vision_embed_dim
         self.hidden_dim = config.hidden_dim
-        self.vocab_size = vocab_size
         self.max_length = config.max_length
+        self.vocab_size = vocab_size
 
         # projection from ViT dimension to decoder dimension
         self.projection = nn.Linear(self.embed_dim, self.hidden_dim)
@@ -128,9 +128,7 @@ class CLIPtionModel(nn.Module):
         self.output_projection = nn.Linear(
             self.captioner.hidden_dim, self.tokenizer.vocab_size, bias=False
         )
-        self.output_projection.weight = nn.Parameter(
-            clip_embed_weight.clone(), requires_grad=False
-        )
+        self.output_projection.weight = nn.Parameter(clip_embed_weight.clone())
 
     def generate(
         self,
@@ -225,6 +223,7 @@ class CLIPtionModel(nn.Module):
                 beam_width=beam_width,
                 ramble=ramble,
             )
+
             # pick highest scoring candidate
             candidates.sort(key=lambda x: x[0], reverse=False)
             for score, text in candidates:
@@ -386,7 +385,10 @@ class CLIPtionModel(nn.Module):
 
         # add final EOS token
         current_tokens = torch.cat(
-            [current_tokens, torch.full((beam_width, 1), tokenizer.eos_token_id, device=device)],
+            [
+                current_tokens,
+                torch.full((beam_width, 1), tokenizer.eos_token_id, device=device),
+            ],
             dim=1,
         )
 
@@ -404,10 +406,13 @@ class CLIPtionModel(nn.Module):
         return candidates
 
     def _text_to_embed(self, text: str, device: torch.device) -> torch.Tensor:
-        tokens = self.clip_text.tokenize(text)
+        # load CLIP model and disable final projection since that's missing from comfy checkpoints
         self.clip_text.load_model()
         self.clip_text.cond_stage_model.reset_clip_options()
         self.clip_text.cond_stage_model.set_clip_options({"projected_pooled": False})
+
+        # calculate text embedding
+        tokens = self.clip_text.tokenize(text)
         clip_l = self.clip_text.cond_stage_model.clip_l
         _, pooled = clip_l.encode_token_weights(tokens["l"])
         text_embeds = self.text_projection(pooled.to(device, dtype=torch.float16))
