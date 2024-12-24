@@ -1,6 +1,6 @@
 ![CLIPtion diagram](media/CLIPtion-diagram.png)
 
-**CLIPtion** is a fast and small captioning extension to [OpenAI CLIP](https://github.com/openai/CLIP/) ViT-L/14. You already have ViT-L loaded when using using Stable Diffusion, SDXL, SD3, FLUX, etc and with just an extra *100MB memory* you can include caption/prompt generation in your workflows!
+**CLIPtion** is a fast and small captioning extension to [OpenAI CLIP](https://github.com/openai/CLIP/) ViT-L/14. You already have ViT-L loaded when using Stable Diffusion, SDXL, SD3, FLUX, etc and with just an extra *100MB memory* you can include caption/prompt generation in your workflows!
 
 I made this for fun and am sure bigger dedicated caption models and VLM's will give you more accurate captioning, but this guy is tiny, fast, reuses what you already have loaded, and has options to give better CLIP alignment so give it a try if you like!
 
